@@ -6,21 +6,27 @@ import java.io.ByteArrayOutputStream
 /**
  * محرّك بناء أوامر بروتوكول Canon CAPT (Canon Advanced Printing Technology).
  *
- * ⚠️ حالة هذا الملف: هيكل عام + الأجزاء الموثقة فقط من إعادة الهندسة العكسية
- * العامة لبروتوكول CAPT (مشروع captdriver مفتوح المصدر، GPLv3).
- * القيم الخاصة بطراز LBP6030B تحديدًا (بايتات إعداد الصفحة، صيغة ضغط
- * الراستر) غير مؤكدة بعد ولازم تُستخرج من التقاط USB حقيقي (usbmon على
- * لينكس مع تعريف Canon الرسمي) قبل الاعتماد عليها في الإنتاج.
+ * مرجع البروتوكول العام (GPLv3):
+ * https://github.com/agalakhov/captdriver/blob/master/SPECS
  *
- * مرجع البروتوكول العام:
- * https://github.com/agalakhov/captdriver/blob/master/SPECS (GPLv3)
+ * ⚠️ حالة هذا الملف بعد التحديث:
+ * - قسم 3 (خوارزمية ضغط Hi-SCoA) مُطبَّق بالكامل الآن في HiScoaEncoder.kt
+ *   وبيانات الصورة الفعلية تُرسل ضمن التدفق (لم تعد أوامر تحكم فارغة).
+ * - القيم الخاصة بطراز الطابعة تحديدًا (بايتات "model magic" في
+ *   cmdPageParams، بايت نوع الورق، إلخ) لا تزال Placeholders غير
+ *   مؤكدة لطراز LBP6030B تحديدًا — SPECS نفسه يعلّم أغلبها بـ "؟"
+ *   حتى لموديلات أخرى موثّقة (lbp2900/lbp3000/lbp3010). يجب تأكيدها
+ *   عبر التقاط USB حقيقي (usbmon) قبل الاعتماد عليها في الإنتاج.
+ * - إطار إرسال بيانات الـ band المضغوطة نفسها (هل تُرسل كتدفق USB
+ *   خام مباشر بعد أوامر 0xD0xx كما هو مُطبَّق هنا، أم ضمن حزمة أخرى
+ *   بترويسة إضافية) غير موثّق صراحة في SPECS العام المتاح؛ الكود
+ *   الأصلي لمشروع captdriver يُخفي هذا التفصيل خلف دالة send_band()
+ *   خاصة بكل طراز طابعة (غير منشورة للطرز الحديثة). التطبيق هنا
+ *   يفترض إرسالًا مباشرًا (الأكثر ترجيحًا لأن Hi-SCoA يحمل علاماته
+ *   الخاصة لنهاية النطاق/الصفحة ضمن التدفق نفسه) — يُنصح بالتحقق
+ *   من هذه النقطة تحديدًا عبر التقاط حقيقي إن لم تطبع الصفحة بعد.
  */
 object CaptRenderer {
-
-    // ---------------------------------------------------------------
-    // 1) تأطير الحزمة العام (موثّق ومؤكد لكل طرازات CAPT)
-    // ---------------------------------------------------------------
-    // بنية كل أمر: [command: uint16 LE][size: uint16 LE شامل الهيدر][payload...]
 
     private fun buildCommand(command: Int, payload: ByteArray = ByteArray(0)): ByteArray {
         val size = 4 + payload.size
@@ -37,65 +43,42 @@ object CaptRenderer {
     }
 
     // ---------------------------------------------------------------
-    // 2) أوامر الحالة/التعريف (موثقة - جزء "A0/A1" من البروتوكول)
-    //    هذه الأوامر بدون بيانات وليها رد من الطابعة (لازم تُقرأ قبل أي أمر تاني)
+    // أوامر الحالة/التعريف (0xA0/0xA1) — بدون بيانات، لها رد
     // ---------------------------------------------------------------
-
-    /** NOP / احصل على حالة أساسية */
     fun cmdGetStatus(): ByteArray = buildCommand(0xA0A0)
-
-    /** احصل على حالة الطابعة */
     fun cmdGetPrinterStatus(): ByteArray = buildCommand(0xA0A1)
-
-    /** احصل على الحالة الموسّعة (تحتوي أرقام الصفحات الجاري معالجتها/طباعتها) */
     fun cmdGetExtendedStatus(): ByteArray = buildCommand(0xA0A8)
-
-    /**
-     * احصل على معرّف الطابعة (IEEE-1284 Device ID).
-     * ملاحظة: هذا الأمر رده خام (raw string) وليس بصيغة الحزمة القياسية.
-     */
     fun cmdGetDeviceId(): ByteArray = buildCommand(0xA1A0)
-
-    /** احصل على إمكانيات الطابعة */
     fun cmdGetCapabilities(): ByteArray = buildCommand(0xA1A1)
 
     // ---------------------------------------------------------------
-    // 3) أوامر إعداد الصفحة/الضغط (0xD0xx) — هيكل الحزمة مؤكد،
-    //    لكن القيم الداخلية (byte values) تختلف من طراز لآخر ولازم
-    //    تُستخرج فعليًا من التقاط حقيقي لطابعتك. القيم هنا Placeholders
-    //    مبنية على أقرب طراز موثّق (lbp3010) ولازم تتفحص/تتعدل.
+    // معاملات الصفحة (0xD0A0)
     // ---------------------------------------------------------------
-
     data class PageParams(
-        val widthPixels: Int,      // عرض الصفحة بالبكسل (600 dpi)
-        val heightPixels: Int,     // ارتفاع الصفحة بالبكسل
-        val lineSizeBytes: Int,    // عرض السطر بالبايت (LINESIZE)
-        val heightLines: Int,      // عدد الأسطر
+        val widthPixels: Int,
+        val heightPixels: Int,
+        val lineSizeBytes: Int,
+        val heightLines: Int,
         val marginWidth: Int = 0,
         val marginHeight: Int = 0,
-        val tonerDensity: Int = 0x1c  // TODO: تأكيد القيمة الفعلية للطابعة
+        val tonerDensity: Int = 0x1c // TODO: تأكيد القيمة الفعلية للطابعة
     )
 
-    /**
-     * أمر "معاملات الصفحة" (0xD0A0). إلزامي قبل كل صفحة.
-     * TODO: البايتات المُعلّمة أدناه بحاجة لتأكيد من التقاط حقيقي —
-     * راجع دالة parsePageSetupFromCapture() في أداة التحليل.
-     */
     fun cmdPageParams(params: PageParams): ByteArray {
         val out = ByteArrayOutputStream()
-        writeU16LE(out, 0x0000)          // ?
-        writeU16LE(out, 0x0000)          // TODO: قيمة ثابتة تخص الطراز (model magic)
-        writeU16LE(out, 0x0002)          // ? مرتبط بأبعاد الصفحة
+        writeU16LE(out, 0x0000)
+        writeU16LE(out, 0x0000)          // TODO: "model magic" الخاص بالطراز
+        writeU16LE(out, 0x0002)          // مرتبط بحجم الصفحة (A4 هنا)
         writeU16LE(out, 0x0000)
         out.write(byteArrayOf(
             params.tonerDensity.toByte(), params.tonerDensity.toByte(),
             params.tonerDensity.toByte(), params.tonerDensity.toByte()
         ))
-        out.write(0x00)                  // نوع الورق: TODO تأكيد (Plain=?)
-        out.write(0x11)                  // TODO: قيمة مرتبطة بحجم الصفحة
+        out.write(0x00)                  // نوع الورق: عادي (TODO: تأكيد)
+        out.write(0x11)                  // TODO: مرتبط بحجم الصفحة
         writeU16LE(out, 0x0004)
         out.write(0x00); out.write(0x01); out.write(0x01); out.write(0x02)
-        out.write(0x00)                  // توفير الحبر: 0=لا
+        out.write(0x00)                  // توفير الحبر: لا
         writeU16LE(out, 0x0000)
         writeU16LE(out, params.marginHeight)
         writeU16LE(out, params.marginWidth)
@@ -106,21 +89,31 @@ object CaptRenderer {
         return buildCommand(0xD0A0, out.toByteArray())
     }
 
-    /** تهيئة الصفحة (لا بيانات) — تُرسل قبل كل صفحة */
     fun cmdInitPage(): ByteArray = buildCommand(0xD0A1)
-
-    /** إعادة ضبط — تُرسل بعد الصفحة (أو قبلها أحيانًا) */
     fun cmdReset(): ByteArray = buildCommand(0xD0A2)
 
-    // ---------------------------------------------------------------
-    // 4) بناء تدفّق الطباعة الكامل لصفحة واحدة
-    // ---------------------------------------------------------------
+    /**
+     * معاملات ضغط Hi-SCoA (0xD0A4). إلزامي قبل إرسال بيانات مضغوطة.
+     * القيم L0=0 (ثابت)، L2=-7، L3=1، L5=4 تُطابق محرك HiScoaEncoder
+     * الذي لا يستخدم فعليًا سوى POS0 (L0) وPOS3 (L3). L2/L4/L5 هنا
+     * لملء بنية الأمر فقط وليست مستخدمة فعليًا من طرفنا.
+     */
+    fun cmdCompressionParams(l3: Int = 1, l5: Int = 4, l2: Int = -7): ByteArray {
+        val payload = byteArrayOf(
+            l3.toByte(),   // L3 (موجب)
+            l5.toByte(),   // L5 (موجب)
+            0x01,          // flag
+            0x01,          // bpp = 1 (أبيض/أسود)
+            0x00,          // L0 (ثابت صفر)
+            l2.toByte(),   // L2 (سالب)
+            0x00, 0x00     // L4 (int16 LE) — غير مستخدم هنا
+        )
+        return buildCommand(0xD0A4, payload)
+    }
 
     /**
-     * يبني تسلسل الأوامر الكامل لطباعة صورة bitmap واحدة كصفحة.
-     * ⚠️ بيانات الراستر نفسها (ضغط Hi-SCoA) غير منفّذة بعد — راجع
-     * TODO أسفل الدالة. القيمة المُرجعة حاليًا فقط أوامر التحكم
-     * (control commands) بدون بيانات البكسل الفعلية.
+     * يبني تسلسل الأوامر الكامل + البيانات المضغوطة لطباعة صورة bitmap
+     * واحدة كصفحة واحدة (نطاق/band واحد يغطي كامل الصفحة).
      */
     fun render(bitmap: Bitmap): ByteArray {
         val mono = ImageUtils.toMonochrome(bitmap)
@@ -133,15 +126,17 @@ object CaptRenderer {
             heightLines = mono.height
         )
 
+        val compressed = HiScoaEncoder.compress(
+            packed = mono.packedBits,
+            lineSizeBytes = lineSizeBytes,
+            isLastBand = true // نطاق واحد فقط = كامل الصفحة
+        )
+
         val out = ByteArrayOutputStream()
-        out.write(cmdInitPage())
         out.write(cmdPageParams(params))
-
-        // TODO: هنا المفروض تتضاف بيانات الراستر المضغوطة (Hi-SCoA)
-        // بدل ما تتبعت البيانات خام. انظر SPECS section 3 لخوارزمية
-        // الضغط الكاملة (LZ77 مبسّطة + Elias gamma coding).
-        // out.write(compressHiScoa(mono.packedBits, lineSizeBytes))
-
+        out.write(cmdInitPage())
+        out.write(cmdCompressionParams())
+        out.write(compressed)          // بيانات الصورة المضغوطة فعليًا
         out.write(cmdReset())
         return out.toByteArray()
     }

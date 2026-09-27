@@ -9,10 +9,12 @@ import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Button
+import android.widget.EditText
 import android.widget.RadioGroup
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import com.salimaprint.app.network.LprPrintClient
 import com.salimaprint.app.render.CaptRenderer
 import com.salimaprint.app.render.EscPosRenderer
 import com.salimaprint.app.render.PclRenderer
@@ -113,6 +115,77 @@ class MainActivity : AppCompatActivity() {
                 else
                     "فشل الإرسال"
             }
+        }
+
+        // --------------------------------------------------------------
+        // الطباعة عبر الشبكة (LPR) - جسر Windows، بديل عن USB المباشر
+        // --------------------------------------------------------------
+        val editServerIp = findViewById<EditText>(R.id.editServerIp)
+        val editQueueName = findViewById<EditText>(R.id.editQueueName)
+        val textLprStatus = findViewById<TextView>(R.id.textLprStatus)
+
+        findViewById<Button>(R.id.buttonPrintLpr).setOnClickListener {
+            val imageUri = selectedImageUri
+            val host = editServerIp.text.toString().trim()
+            val queue = editQueueName.text.toString().trim()
+
+            if (imageUri == null) {
+                textLprStatus.text = "اختر صورة ولاً"
+                return@setOnClickListener
+            }
+            if (host.isEmpty() || queue.isEmpty()) {
+                textLprStatus.text = "اكتب عنوان IP واسم مشاركة الطابعة"
+                return@setOnClickListener
+            }
+
+            val language = when (radioGroup.checkedRadioButtonId) {
+                R.id.radioPcl -> "PCL"
+                R.id.radioEscPos -> "ESCPOS"
+                else -> "PCL" // الأنسب افتراضيًا لأن Windows بيمرر البيانات خام للدرايفر
+            }
+
+            textLprStatus.text = "جارٍ الإرسال إلى $host ($queue) ..."
+
+            uiScope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    printImageViaLpr(imageUri, host, queue, language)
+                }
+                textLprStatus.text = result
+            }
+        }
+    }
+
+    /**
+     * يرسم الصورة بصيغة PCL/ESC-POS (نفس المحرّكات المُستخدمة في مسار USB)
+     * ثم يبعتها عبر بروتوكول LPR لجهاز Windows الوسيط. Windows بدوره
+     * بيمرر البيانات لدرايفر Canon الرسمي المُركّب عليه (UFR II LT)
+     * واللي بيتفاهم مع الطابعة مباشرة - فمفيش داعي لفك تشفير CAPT هنا.
+     */
+    private fun printImageViaLpr(
+        imageUri: Uri,
+        host: String,
+        queueName: String,
+        language: String
+    ): String {
+        val bitmap = contentResolver.openInputStream(imageUri)?.use {
+            BitmapFactory.decodeStream(it)
+        } ?: return "تعذرت قراءة الصورة"
+
+        val payload: ByteArray = when (language) {
+            "PCL" -> PclRenderer.render(bitmap)
+            else -> EscPosRenderer.render(bitmap)
+        }
+
+        return try {
+            LprPrintClient(host = host, queueName = queueName).printRaw(
+                data = payload,
+                jobName = "SalimaPrint"
+            )
+            "تم إرسال المهمة بنجاح عبر LPR إلى $queueName"
+        } catch (e: LprPrintClient.LprException) {
+            "فشل الإرسال: ${e.message}"
+        } catch (e: Exception) {
+            "خطأ غير متوقع: ${e.message}"
         }
     }
 
