@@ -18,6 +18,7 @@ import com.salimaprint.app.network.LprPrintClient
 import com.salimaprint.app.render.CaptRenderer
 import com.salimaprint.app.render.EscPosRenderer
 import com.salimaprint.app.render.PclRenderer
+import com.salimaprint.app.usb.CaptSession
 import com.salimaprint.app.usb.UsbPrinterManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +31,7 @@ class MainActivity : AppCompatActivity() {
     private var currentDevice: UsbDevice? = null
     private var currentConnection: UsbDeviceConnection? = null
     private var currentHandle: UsbPrinterManager.PrinterHandle? = null
+    @Volatile private var lastCaptLog: String = ""
     private var detectedLanguages: Set<String> = emptySet()
     private var selectedImageUri: Uri? = null
 
@@ -110,10 +112,14 @@ class MainActivity : AppCompatActivity() {
                 val success = withContext(Dispatchers.IO) {
                     printImage(device, imageUri, language)
                 }
-                textStatus.text = if (success)
+                val base = if (success)
                     "تم إرسال المهمة إلى الطابعة"
                 else
                     "فشل الإرسال"
+                textStatus.text =
+                    if (language == "CAPT" && lastCaptLog.isNotEmpty())
+                        base + "\n\n" + lastCaptLog
+                    else base
             }
         }
 
@@ -251,18 +257,23 @@ class MainActivity : AppCompatActivity() {
             BitmapFactory.decodeStream(it)
         } ?: return false
 
-        val payload: ByteArray = when (language) {
-            "PCL" -> PclRenderer.render(bitmap)
-            "CAPT" -> CaptRenderer.render(bitmap)
-            else -> EscPosRenderer.render(bitmap)
-        }
-
         val connection = currentConnection ?: run {
             val androidUsbManager =
                 getSystemService(Context.USB_SERVICE) as UsbManager
             androidUsbManager.openDevice(device) ?: return false
         }
         val handle = currentHandle ?: usbManager.open(device) ?: return false
+
+        if (language == "CAPT") {
+            val (ok, log) = CaptSession.print(usbManager, connection, handle, bitmap)
+            lastCaptLog = log
+            return ok
+        }
+
+        val payload: ByteArray = when (language) {
+            "PCL" -> PclRenderer.render(bitmap)
+            else -> EscPosRenderer.render(bitmap)
+        }
 
         return usbManager.sendRaw(connection, handle, payload)
     }

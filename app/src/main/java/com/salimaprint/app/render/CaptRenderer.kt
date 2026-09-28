@@ -111,6 +111,55 @@ object CaptRenderer {
         return buildCommand(0xD0A4, payload)
     }
 
+
+    // ---------------------------------------------------------------
+    // أوامر الجلسة (مصدرها: تحليل عكسي منشور من مطوّر captdriver على
+    // linux.org.ru، 2013 — قد تختلف تفاصيل الحمولة بين الطرازات)
+    // ---------------------------------------------------------------
+    fun cmdStartOfWork(): ByteArray = buildCommand(0xA1A1)       // يرد بمعلومات الطراز
+    fun cmdA3A2(): ByteArray = buildCommand(0xA3A2)              // يرد 0x0000 دائمًا
+    fun cmdCheckReady(): ByteArray = buildCommand(0xE0A0)        // bit 0x0008 = المخزن ممتلئ
+    fun cmdStart1(): ByteArray = buildCommand(0xE0A3)
+    fun cmdStart2(): ByteArray = buildCommand(0xE0A2)
+    fun cmdStart3(): ByteArray = buildCommand(0xE0A4)
+    // TODO: الطابعة الحقيقية تتوقع غالبًا "magic sequence" كحمولة هنا (غير معروفة)
+    fun cmdE0A5(): ByteArray = buildCommand(0xE0A5)
+    fun cmdEndOfLoad(): ByteArray = buildCommand(0xC0A4)
+    fun cmdEnablePrint(): ByteArray {
+        val out = ByteArrayOutputStream()
+        writeU16LE(out, 0x0001)
+        return buildCommand(0xE0A7, out.toByteArray())
+    }
+
+    /** 0xD0A9: يغلّف أوامر D0xx متتابعة (page params + init + compression) */
+    fun cmdSetParms(vararg subCommands: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        subCommands.forEach { out.write(it) }
+        return buildCommand(0xD0A9, out.toByteArray())
+    }
+
+    /** 0xC0A0: الأمر الرئيسي — يحمّل الصورة المضغوطة (بدون رد) */
+    fun cmdPrintData(compressed: ByteArray): ByteArray = buildCommand(0xC0A0, compressed)
+
+    data class CaptPage(val setParms: ByteArray, val printData: ByteArray)
+
+    /** يجهّز أجزاء الصفحة للجلسة الثنائية الاتجاه (CaptSession) */
+    fun buildPage(bitmap: Bitmap): CaptPage {
+        val mono = ImageUtils.toMonochrome(bitmap)
+        val lineSizeBytes = (mono.width + 7) / 8
+        val params = PageParams(
+            widthPixels = mono.width,
+            heightPixels = mono.height,
+            lineSizeBytes = lineSizeBytes,
+            heightLines = mono.height
+        )
+        val compressed = HiScoaEncoder.compress(mono.packedBits, lineSizeBytes, true)
+        return CaptPage(
+            setParms = cmdSetParms(cmdPageParams(params), cmdInitPage(), cmdCompressionParams()),
+            printData = cmdPrintData(compressed)
+        )
+    }
+
     /**
      * يبني تسلسل الأوامر الكامل + البيانات المضغوطة لطباعة صورة bitmap
      * واحدة كصفحة واحدة (نطاق/band واحد يغطي كامل الصفحة).

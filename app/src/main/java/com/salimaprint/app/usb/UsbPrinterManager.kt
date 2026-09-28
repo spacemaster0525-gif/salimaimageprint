@@ -41,7 +41,8 @@ class UsbPrinterManager(private val context: Context) {
     data class PrinterHandle(
         val device: UsbDevice,
         val usbInterface: UsbInterface,
-        val endpointOut: UsbEndpoint
+        val endpointOut: UsbEndpoint,
+        val endpointIn: UsbEndpoint? = null
     )
 
     fun listPrinters(): List<UsbDevice> {
@@ -107,7 +108,58 @@ class UsbPrinterManager(private val context: Context) {
             .firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
             ?: return null
 
-        return PrinterHandle(device, printerInterface, endpointOut)
+        val endpointIn = (0 until printerInterface.endpointCount)
+            .map { printerInterface.getEndpoint(it) }
+            .firstOrNull {
+                it.direction == UsbConstants.USB_DIR_IN &&
+                    it.type == UsbConstants.USB_ENDPOINT_XFER_BULK
+            }
+
+        return PrinterHandle(device, printerInterface, endpointOut, endpointIn)
+    }
+
+    /**
+     * Envoie une commande CAPT puis lit la réponse de l'imprimante.
+     * Format de réponse (d'après l'auteur du driver captdriver) :
+     * [cmd(2)][longueur totale(2)][données...], minimum 6 octets, lus en
+     * un premier read() de 6 octets puis un second pour le reste.
+     * IMPORTANT : ne pas lire la réponse fait "geler" l'imprimante.
+     * Retourne null en cas d'échec/timeout.
+     */
+    fun sendCommandExpectReply(
+        connection: UsbDeviceConnection,
+        handle: PrinterHandle,
+        command: ByteArray,
+        timeoutMs: Int = 5000
+    ): ByteArray? {
+        val endpointIn = handle.endpointIn ?: return null
+        if (!connection.claimInterface(handle.usbInterface, true)) return null
+        try {
+            var offset = 0
+            while (offset < command.size) {
+                val len = minOf(4096, command.size - offset)
+                val sent = connection.bulkTransfer(
+                    handle.endpointOut, command, offset, len, timeoutMs
+                )
+                if (sent <= 0) return null
+                offset += sent
+            }
+
+            val header = ByteArray(6)
+            val n = connection.bulkTransfer(endpointIn, header, 0, 6, timeoutMs)
+            if (n < 4) return null
+            val declared =
+                (header[2].toInt() and 0xFF) or ((header[3].toInt() and 0xFF) shl 8)
+            if (declared <= n) return header.copyOf(n)
+
+            val remaining = declared - n
+            val rest = ByteArray(remaining)
+            val n2 = connection.bulkTransfer(endpointIn, rest, 0, remaining, timeoutMs)
+            if (n2 <= 0) return header.copyOf(n)
+            return header.copyOf(n) + rest.copyOf(n2)
+        } catch (_: Exception) {
+            return null
+        }
     }
 
     fun readDeviceId(connection: UsbDeviceConnection, iface: UsbInterface): String? {
@@ -133,7 +185,7 @@ class UsbPrinterManager(private val context: Context) {
     ): Boolean {
         if (!connection.claimInterface(handle.usbInterface, true)) return false
         var offset = 0
-        val chunkSize = 16 * 1024
+        val chunkSize = 4096
         try {
             while (offset < data.size) {
                 val len = minOf(chunkSize, data.size - offset)
