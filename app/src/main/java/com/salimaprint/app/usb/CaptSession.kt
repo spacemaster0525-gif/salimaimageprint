@@ -43,7 +43,8 @@ object CaptSession {
         for ((name, cmd) in mandatory) {
             val r = usb.sendCommandExpectReply(connection, handle, cmd)
             log.append("$name: ${hex(r)}\n")
-            if (r == null) return false to log.append("فشل عند: $name").toString()
+            if (r == null)
+                return false to log.append("فشل عند: $name\nالسبب: ${usb.lastError}").toString()
         }
 
         // خطوات "تفعيل" — نكمل حتى لو لم يأتِ رد (بحسب المصدر غيابها لا يمنع الطباعة)
@@ -56,7 +57,7 @@ object CaptSession {
         )
         for ((name, cmd) in optional) {
             val r = usb.sendCommandExpectReply(connection, handle, cmd)
-            log.append("$name: ${hex(r)}\n")
+            log.append("$name: ${hex(r)}" + (if (r == null) " (${usb.lastError})" else "") + "\n")
         }
 
         val page = CaptRenderer.buildPage(bitmap)

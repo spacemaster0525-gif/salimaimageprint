@@ -124,14 +124,24 @@ class UsbPrinterManager(private val context: Context) {
     // Minimum 6 octets : un premier read() de 6 octets, puis un second
     // pour le reste. IMPORTANT : ne pas lire la reponse fait geler
     // l'imprimante. Retourne null en cas d'echec ou de timeout.
+    @Volatile var lastError: String = ""
+
     fun sendCommandExpectReply(
         connection: UsbDeviceConnection,
         handle: PrinterHandle,
         command: ByteArray,
         timeoutMs: Int = 5000
     ): ByteArray? {
-        val endpointIn = handle.endpointIn ?: return null
-        if (!connection.claimInterface(handle.usbInterface, true)) return null
+        lastError = ""
+        val endpointIn = handle.endpointIn
+        if (endpointIn == null) {
+            lastError = "no IN endpoint"
+            return null
+        }
+        if (!connection.claimInterface(handle.usbInterface, true)) {
+            lastError = "claimInterface failed"
+            return null
+        }
         try {
             var offset = 0
             while (offset < command.size) {
@@ -139,23 +149,41 @@ class UsbPrinterManager(private val context: Context) {
                 val sent = connection.bulkTransfer(
                     handle.endpointOut, command, offset, len, timeoutMs
                 )
-                if (sent <= 0) return null
+                if (sent <= 0) {
+                    lastError = "write failed code=$sent"
+                    return null
+                }
                 offset += sent
             }
 
-            val header = ByteArray(6)
-            val n = connection.bulkTransfer(endpointIn, header, 0, 6, timeoutMs)
-            if (n < 4) return null
+            // IMPORTANT : le buffer de lecture doit etre au moins aussi grand
+            // que le paquet USB (sinon overflow => -1 sur Android). On lit
+            // large, puis on interprete la longueur declaree dans l'en-tete.
+            val mps = maxOf(endpointIn.maxPacketSize, 64)
+            val bufSize = mps * 16
+            val buf = ByteArray(bufSize)
+            val n = connection.bulkTransfer(endpointIn, buf, 0, bufSize, timeoutMs)
+            if (n < 4) {
+                lastError = "read failed code=$n (mps=$mps)"
+                return null
+            }
+            var total = n
             val declared =
-                (header[2].toInt() and 0xFF) or ((header[3].toInt() and 0xFF) shl 8)
-            if (declared <= n) return header.copyOf(n)
-
-            val remaining = declared - n
-            val rest = ByteArray(remaining)
-            val n2 = connection.bulkTransfer(endpointIn, rest, 0, remaining, timeoutMs)
-            if (n2 <= 0) return header.copyOf(n)
-            return header.copyOf(n) + rest.copyOf(n2)
-        } catch (_: Exception) {
+                (buf[2].toInt() and 0xFF) or ((buf[3].toInt() and 0xFF) shl 8)
+            val out = java.io.ByteArrayOutputStream()
+            out.write(buf, 0, n)
+            // completer si la reponse annoncee est plus longue que ce qui est recu
+            var guard = 0
+            while (total < declared && guard < 64) {
+                val m = connection.bulkTransfer(endpointIn, buf, 0, bufSize, timeoutMs)
+                if (m <= 0) break
+                out.write(buf, 0, m)
+                total += m
+                guard++
+            }
+            return out.toByteArray()
+        } catch (e: Exception) {
+            lastError = "exception: ${e.message}"
             return null
         }
     }
