@@ -1,4 +1,4 @@
-name: Build APK v2
+name: Build APK
 
 on:
   push:
@@ -15,6 +15,7 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # Android SDK مثبّت مسبقاً على أجهزة GitHub، لذا لا حاجة لـ setup-android
       - name: Accept Android SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
